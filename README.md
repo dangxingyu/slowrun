@@ -56,6 +56,7 @@ The limited-compute track caps runs at a single 8xH100 node for at most 1 hour.
 18 | 3.211 | Add [MuonEq-R](https://arxiv.org/abs/2603.28254) | 04/17/26 | 59.4 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a2ed9f4530d2dbd80b8cc0b8775659b196053277/train.py) | [@clarkkev](https://github.com/clarkkev)
 19 | 3.204 | Add document-level shuffling | 04/24/26 | 59.0 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a4732774888d535f681295de4ef1c66a57a3cc60/train.py) | [@samacqua](https://x.com/Sam_Acqua)
 20 | 3.195 | Add weight decay schedule, adjust learning rate schedule | 04/26/26 | 59.0 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/571b296eda47bdd291937d017ea49f23317088cb/train.py) | [@shmublu](https://x.com/ShmuelBerman)
+21 | 3.183 | First-order meta-gradient every step (split half-batches, temporary step on the Muon matrices); dropout 0.05, no stochastic depth | 09/05/26 | 59.3 mins | [Script](https://github.com/dangxingyu/slowrun/blob/ttt-every-step-1h/train.py) | [@dangxingyu](https://github.com/dangxingyu)
 
 
 ### Tiny Track (15 minutes)
