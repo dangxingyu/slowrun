@@ -126,12 +126,12 @@ parser.add_argument("--mtp-predict", type=int, default=3,
                     help="MTP: number of future tokens predicted from each position (1 = plain next-token).")
 parser.add_argument("--mtp-anneal-frac", type=float, default=0.66,
                     help="Fraction of training over which the extra MTP heads decay to zero weight.")
-# --- every-step training-time-testing episode (default for this entry; --ttt-every 0 = entry 14) ---
+# --- every-step meta-gradient step (default for this entry; --mg-every 0 = entry 14) ---
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--ttt-every", type=int, default=1, help="episode every N steps (1 = every step, the record; 0 = off = entry 14)")
-parser.add_argument("--ttt-step-norm", type=float, default=0.5, help="L2 norm of the temporary step on the plastic matrices")
-parser.add_argument("--ttt-step-schedule", type=str, default="const", choices=["const", "lr"])
-parser.add_argument("--ttt-plastic", type=str, default="mlp_all", choices=["matrix_all", "mlp_all"])
+parser.add_argument("--mg-every", type=int, default=1, help="meta-gradient step every N steps (1 = every step, the record; 0 = off = entry 14)")
+parser.add_argument("--mg-step-norm", type=float, default=0.5, help="L2 norm of the temporary step on the plastic matrices")
+parser.add_argument("--mg-step-schedule", type=str, default="const", choices=["const", "lr"])
+parser.add_argument("--mg-plastic", type=str, default="mlp_all", choices=["matrix_all", "mlp_all"])
 args = parser.parse_args()
 
 # Resolve output path
@@ -1262,10 +1262,10 @@ model = torch.compile(model, dynamic=False)
 # Optimizer
 optimizer = model.setup_optimizer()
 
-# ---- every-step training-time-testing episode ----
-TTT = args.ttt_every > 0
-ttt_params, ttt_owned = [], []   # plastic matrices; indices of the ones this rank owns in the Muon step
-if TTT:
+# ---- every-step meta-gradient step ----
+MG = args.mg_every > 0
+mg_params, mg_owned = [], []   # plastic matrices; indices of the ones this rank owns in the Muon step
+if MG:
     owned_ids = set()
     for g in optimizer.param_groups:
         if g.get("kind") == "muon":   # Muon updates params[rank*chunk:(rank+1)*chunk] on this rank and all-gathers the rest
@@ -1273,27 +1273,27 @@ if TTT:
             owned_ids.update(id(p) for p in g["params"][ddp_rank * chunk:(ddp_rank + 1) * chunk])
     muon_ids = {id(p) for g in optimizer.param_groups if g.get("kind") == "muon" for p in g["params"]}
     for name, p in orig_model.named_parameters():
-        if id(p) in muon_ids and (args.ttt_plastic == "matrix_all" or ".mlp." in name):
-            ttt_params.append(p)
+        if id(p) in muon_ids and (args.mg_plastic == "matrix_all" or ".mlp." in name):
+            mg_params.append(p)
             if id(p) in owned_ids:
-                ttt_owned.append(len(ttt_params) - 1)
-    print0(f"[ttt] every {args.ttt_every} steps, step norm {args.ttt_step_norm} ({args.ttt_step_schedule}), "
-           f"{len(ttt_params)} plastic matrices, {sum(p.numel() for p in ttt_params):,} parameters; "
-           f"rank {ddp_rank} restores {len(ttt_owned)} of them")
-ttt_owned_params = [ttt_params[i] for i in ttt_owned]
+                mg_owned.append(len(mg_params) - 1)
+    print0(f"[mg] every {args.mg_every} steps, step norm {args.mg_step_norm} ({args.mg_step_schedule}), "
+           f"{len(mg_params)} plastic matrices, {sum(p.numel() for p in mg_params):,} parameters; "
+           f"rank {ddp_rank} restores {len(mg_owned)} of them")
+mg_owned_params = [mg_params[i] for i in mg_owned]
 
 @torch.no_grad()
-def ttt_temporary_step(step):
+def mg_temporary_step(step):
     """theta_P <- theta_P - eta * g_P / ||g_P|| with g the gradient of the first half-batch on this rank.
     Returns (scaled gradient of the owned matrices, alpha) so the caller can undo the step: the Muon
     step overwrites every matrix this rank does not own with the owner's all-gathered copy, so only
     the owned matrices need restoring."""
-    grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in ttt_params]
+    grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in mg_params]
     norm = torch.linalg.vector_norm(torch.stack(torch._foreach_norm(grads))).clamp_min(1e-12)
-    eta = args.ttt_step_norm * (get_lr_multiplier(step) if args.ttt_step_schedule == "lr" else 1.0)
+    eta = args.mg_step_norm * (get_lr_multiplier(step) if args.mg_step_schedule == "lr" else 1.0)
     alpha = -eta / float(norm)
-    kept = [grads[i].clone() for i in ttt_owned]
-    torch._foreach_add_(ttt_params, grads, alpha=alpha)
+    kept = [grads[i].clone() for i in mg_owned]
+    torch._foreach_add_(mg_params, grads, alpha=alpha)
     return kept, alpha
 
 # Dataloaders
@@ -1400,8 +1400,8 @@ precompile_iteration_stages(
     scheduled_iteration_counts,
     precompile_eval_iteration_counts,
 )
-if TTT:
-    # the episode runs two half-batch passes per step; warm that shape for every recurrence stage
+if MG:
+    # the step runs two half-batch passes per step; warm that shape for every recurrence stage
     # too, otherwise the 1x->2x transition recompiles inside the timed region
     _h = x.size(0) // 2
     precompile_iteration_stages(model, x[:_h], y[:_h], get_mtp_weights(step), scheduled_iteration_counts, ())
@@ -1453,20 +1453,20 @@ while current_epoch <= args.num_epochs:
     synchronize()
     t0 = time.time()
     mtp_w = get_mtp_weights(step)  # same weights across the grad-accum micro-steps
-    if TTT and step % args.ttt_every == 0 and grad_accum_steps == 1:
+    if MG and step % args.mg_every == 0 and grad_accum_steps == 1:
         # split pairing on the device batch: first half adapts, second half is evaluated at the
         # adapted point; the optimizer receives the ordinary full-batch mean gradient
         half = x.size(0) // 2
         with autocast_ctx:
             loss = model(x[:half], y[:half], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
         (loss * 0.5).backward()
-        ttt_kept, ttt_alpha = ttt_temporary_step(step)
+        mg_kept, mg_alpha = mg_temporary_step(step)
         with autocast_ctx:
             loss_q = model(x[half:], y[half:], num_iterations=active_num_iterations, mtp_weights=mtp_w).mean()
         (loss_q * 0.5).backward()
         with torch.no_grad():
-            torch._foreach_add_(ttt_owned_params, ttt_kept, alpha=-ttt_alpha)   # restore the owned matrices
-        del ttt_kept
+            torch._foreach_add_(mg_owned_params, mg_kept, alpha=-mg_alpha)   # restore the owned matrices
+        del mg_kept
         train_loss = 0.5 * (loss.detach() + loss_q.detach())
         x, y, epoch = next(train_loader)
     else:
